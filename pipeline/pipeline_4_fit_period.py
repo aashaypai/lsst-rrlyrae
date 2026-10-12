@@ -12,7 +12,7 @@ from pipe_utils import extract_healpixel, get_filepaths
 from config import load_config, override, save_config
 
 
-from period_fitting import period_search, avg_template_fit, fit_vonmises_fisher_kappa
+from period_fitting import period_search, avg_template_fit
 #from plotting import make_phased_lightcurve_plot
 
 sys.path.append('/sdf/data/rubin/user/pai/projects/processing/catalogs')
@@ -93,7 +93,20 @@ def get_match_table(hpx, matchdir, match_flag='match'):
         return None
     return table
     
-def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None, *, cols):
+# Free parameters of the multiband template model: one mean magnitude per fitted
+# band, plus a shared amplitude, phase and period. Check this against pycycle's
+# TemplateFitter if its model differs (e.g. per-band amplitudes); the fitted
+# coefficient names are logged once per pixel to make that easy.
+N_SHARED_PARAMS = 3   # amplitude, phase, period
+
+
+def count_template_params(n_bands):
+    return n_bands + N_SHARED_PARAMS
+
+
+def fit_lightcurve_period_by_healpixel(fp, stats_pixel, outdir, matchdir=None, *, cols):
+    """Fit every object in one lightcurve file. `stats_pixel` holds only this pixel's
+    rows of the stats table that passed the stats cut."""
     hpx = extract_healpixel(fp)
 
     if matchdir is not None:
@@ -116,18 +129,17 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None, *
 
     result_coeff_keys = None
     try:
-        object_ids = np.unique(stats_table[stats_table['healpixel'] == hpx][cols.id].values)
+        object_ids = np.unique(stats_pixel[cols.id].values)
         lightcurves = pd.read_parquet(fp)
         id_mask = np.isin(lightcurves[cols.id].values, object_ids)
         lightcurves = lightcurves[id_mask]
 
+        matched_ids = set(match_table[cols.id].values) if match_table is not None else set()
+
         rows = []
         for obj_id, group in lightcurves.groupby(cols.id):
             
-            match_flag = False
-            if match_table is not None:
-                if obj_id in match_table[cols.id].values:  
-                    match_flag = True
+            match_flag = obj_id in matched_ids
                     
             epoch_time = group[cols.mjd].values
             mags = group[cols.mag].values
@@ -138,31 +150,26 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None, *
                 #period_search_results = period_search(epoch_time, mags, mag_errs, bands)
                 result, template = avg_template_fit(epoch_time, mags, mag_errs, bands)
                 
-                ## RSS per degree of freedom
-                n_obs_cols = [c for c in stats_table.columns if c.endswith('_n_obs')]
-                band_n_obs = stats_table.loc[stats_table[cols.id] == obj_id, n_obs_cols]
-                n_obs = band_n_obs.sum(axis=1).item()
-                
-                DOF = 4
-                rss_dof = result.rss/(n_obs - DOF)
+                ## RSS per degree of freedom, counting only the points and bands
+                ## the template fit used (bands without a template are dropped)
+                fit_mask = np.isin(bands, template.bands)
+                n_fit = int(fit_mask.sum())
+                n_params = count_template_params(len(np.unique(bands[fit_mask])))
+                dof = n_fit - n_params
+                rss_dof = result.rss / dof if dof > 0 else np.full_like(result.rss, np.nan, dtype=float)
+
+                if result_coeff_keys is None:
+                    logger.info(f"template fit coefficients: {list(result.best_coeffs.keys())} "
+                                f"(parameter count assumes {N_SHARED_PARAMS} shared + 1 per band)")
     
-                ## Von Mises-Fisher Kappa
-                try:
-                    mu, mu_err, kappa, kappa_err = fit_vonmises_fisher_kappa(epoch_time, result)
-                except Exception as e:
-                    logger.exception(f"{cols.id} {obj_id}: Von-Mises Fisher Kappa fit FAILED")
-                    mu, mu_err, kappa, kappa_err = np.nan, np.nan, np.nan, np.nan
-                    
                 row = {cols.id: obj_id,
                       'match': match_flag,
                       #'P_search': period_search_results.best_period,
                       'P_template': result.best_period,
                       'template_min_rss': np.nanmin(result.rss),
-                      'template_min_rss_dof': np.nanmin(rss_dof),
-                      'vmf_kappa': kappa,
-                      'vmf_kappa_err': kappa_err,
-                      'vmf_mu': mu,
-                      'vmf_mu_err': mu_err,
+                      'template_min_rss_dof': np.nanmin(rss_dof) if dof > 0 else np.nan,
+                      'n_fit_points': n_fit,
+                      'n_params': n_params,
                       }
                 row.update(result.best_coeffs)
 
@@ -176,10 +183,8 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None, *
                       'P_template': np.nan,
                       'template_min_rss': np.nan,
                       'template_min_rss_dof': np.nan,
-                      'vmf_kappa': np.nan,
-                      'vmf_kappa_err': np.nan,
-                      'vmf_mu': np.nan,
-                      'vmf_mu_err': np.nan,
+                      'n_fit_points': np.nan,
+                      'n_params': np.nan,
                     }
                 if result_coeff_keys is not None:
                     row.update({k: np.nan for k in result_coeff_keys})
@@ -231,6 +236,9 @@ def run_pipeline(lightcurve_dir, stats_dir, outdir, cfg, matchdir=None):
     filepaths = [fp for fp in filepaths if extract_healpixel(os.path.basename(fp)) in kept_healpixels]
     logger.info(f"{len(filepaths)} lightcurve files match a kept healpixel")
 
+    # each worker task gets only its own pixel's rows, not the whole footprint
+    stats_by_pixel = {hpx: rows for hpx, rows in stats_table.groupby('healpixel')}
+
     os.makedirs(outdir, exist_ok=True)
 
     t0 = time.time()
@@ -240,8 +248,9 @@ def run_pipeline(lightcurve_dir, stats_dir, outdir, cfg, matchdir=None):
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(fit_lightcurve_period_by_healpixel, fp, stats_table, outdir, matchdir,
-                            cols=cols): fp
+            executor.submit(fit_lightcurve_period_by_healpixel, fp,
+                            stats_by_pixel[extract_healpixel(os.path.basename(fp))],
+                            outdir, matchdir, cols=cols): fp
             for fp in filepaths
         }
 
