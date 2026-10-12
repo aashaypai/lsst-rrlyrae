@@ -7,15 +7,7 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from astropy.stats import sigma_clip
-
-from schema import (
-    ID_COL, MAG_ERR_COL, 
-    NSIDE, BANDS, OUTDIR, MAX_WORKERS, MIN_POINTS, 
-    MIN_MAG, MAX_MAG, MAX_MAG_ERR, 
-    BAND_1, BAND_2, COLOR_MIN, COLOR_MAX,
-        MIN_OBJECTS_FOR_FIT, SIGMA, MAXITERS
-)
+from config import load_config, override, save_config
 
 from lightcurves import (
     query_dia_object_by_healpixel, 
@@ -30,9 +22,6 @@ from rescale_errors import rescale_errors_by_healpixel, rescale_errors_from_zero
 
 sys.path.append("/sdf/data/rubin/user/pai/projects/processing/catalogs/")
 sys.path.append("/sdf/data/rubin/user/pai/projects/rrlyrae/analysis")
-# ----------------------------------------------------------------------
-# Adjust these imports to match your actual module structure.
-# ----------------------------------------------------------------------
 from healpix_utils import radec_to_healpix, healpix_to_radec
 
 logger = logging.getLogger(__name__)
@@ -54,10 +43,11 @@ def validate_min_points(min_points, bands):
         logger.error(msg)
         raise TypeError(msg)
         
-def build_lightcurves_by_healpixel(hpx, nside, bands,
-                                   min_points, min_mag, max_mag,
-                                   band_1, band_2, color_min, color_max,
-                                   max_mag_err, outdir, **kwargs):
+def build_lightcurves_by_healpixel(hpx, cfg):
+    cols, run, lc, resc = cfg.columns, cfg.run, cfg.lightcurves, cfg.rescaling
+    butler_kwargs = cfg.butler.kwargs()
+    nside, bands, outdir = run.nside, run.bands, run.outdir
+
     logdir = os.path.join(outdir, "pipeline_1_lightcurves_logs")
     os.makedirs(outdir, exist_ok=True)
     os.makedirs(logdir, exist_ok=True)
@@ -71,33 +61,36 @@ def build_lightcurves_by_healpixel(hpx, nside, bands,
 
     t0 = time.time()
     try:
-        min_points = validate_min_points(min_points, bands)
+        min_points = validate_min_points(lc.min_points, bands)
         
-        dia_object = query_dia_object_by_healpixel(hpx, nside, bands, **kwargs)
+        dia_object = query_dia_object_by_healpixel(hpx, nside, bands, **butler_kwargs, cols=cols)
         
         object_table = query_object_by_healpixel(hpx, nside, bands,
-                                                 band_1 = band_1, 
-                                                 band_2 = band_2,
-                                                 color_min = color_min,
-                                                 color_max = color_max, 
-                                                 **kwargs)
+                                                 band_1 = lc.band_1, 
+                                                 band_2 = lc.band_2,
+                                                 color_min = lc.color_min,
+                                                 color_max = lc.color_max, 
+                                                 **butler_kwargs, cols=cols)
         
         dia_object = match_object_and_dia_object(object_table, dia_object, hpx, bands,
-                                min_mag, max_mag, max_sep_arcsec=1, max_extendedness=0.5)
+                                lc.min_mag, lc.max_mag, max_sep_arcsec=lc.max_sep_arcsec,
+                                max_extendedness=lc.max_extendedness, cols=cols)
         
-        dia_obj_frc_src = query_dia_object_forced_source_by_healpixel(dia_object, nside, bands, **kwargs)
+        dia_obj_frc_src = query_dia_object_forced_source_by_healpixel(dia_object, nside, bands,
+                                                                      **butler_kwargs, cols=cols)
         
-        dia_obj_frc_src = rescale_errors_from_zeropoints(dia_obj_frc_src, bands, **kwargs)
+        dia_obj_frc_src = rescale_errors_from_zeropoints(dia_obj_frc_src, bands, **butler_kwargs, cols=cols)
         lightcurves = rescale_errors_by_healpixel(dia_obj_frc_src, bands,
-                                                  min_objects=MIN_OBJECTS_FOR_FIT,
-                                                  sigma=SIGMA,
-                                                  maxiters=MAXITERS)
+                                                  min_objects=resc.min_objects_for_fit,
+                                                  sigma=resc.sigma,
+                                                  maxiters=resc.maxiters,
+                                                  cols=cols)
         
-        lightcurves = max_error_cut(lightcurves, max_mag_err)
-        lightcurves = sigma_clip_cut(lightcurves)
-        lightcurves = min_point_cut(lightcurves, bands, min_points)
+        lightcurves = max_error_cut(lightcurves, lc.max_mag_err, cols=cols)
+        lightcurves = sigma_clip_cut(lightcurves, cols=cols)
+        lightcurves = min_point_cut(lightcurves, bands, min_points, cols=cols)
         
-        n_objects = lightcurves[ID_COL].nunique() if len(lightcurves) else 0
+        n_objects = lightcurves[cols.id].nunique() if len(lightcurves) else 0
 
         if n_objects == 0:
             logger.info("no objects survived -- skipping save")
@@ -124,36 +117,29 @@ def build_lightcurves_by_healpixel(hpx, nside, bands,
         handler.close()
 
 
-def run_pipeline(healpix_footprint_fp, nside=NSIDE, bands=BANDS, outdir=OUTDIR,
-                 min_points=MIN_POINTS, min_mag=MIN_MAG, max_mag=MAX_MAG,
-                 band_1=BAND_1, band_2=BAND_2, color_min=COLOR_MIN, color_max=COLOR_MAX,
-                 max_mag_err=MAX_MAG_ERR, max_workers=MAX_WORKERS, **kwargs):
+def run_pipeline(healpix_footprint_fp, cfg):
+    run, lc = cfg.run, cfg.lightcurves
     healpixels = np.load(healpix_footprint_fp)
     healpixels = np.array([h for h in healpixels if ((healpix_to_radec(h, nside=32)[0] > 300) &
                                       (healpix_to_radec(h, nside=32)[0] < 360))])
     logger.info(f"Loaded {len(healpixels)} healpixels, dtype={healpixels.dtype}")
 
-    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(run.outdir, exist_ok=True)
+    config_path = save_config(cfg, run.outdir, "config_pipeline_1.yaml")
 
-    logger.info(f"Processing {len(healpixels)} HEALPix pixels with {max_workers} parallel workers")
-    logger.info(f"  nside={nside}, bands={bands}")
-    logger.info(f"  min_points={min_points}, min_mag={min_mag}, max_mag={max_mag}, max_mag_err={max_mag_err}")
-    logger.info(f"  output -> {outdir}/")
+    logger.info(f"Processing {len(healpixels)} HEALPix pixels with {run.max_workers} parallel workers")
+    logger.info(f"  nside={run.nside}, bands={run.bands}")
+    logger.info(f"  min_points={lc.min_points}, min_mag={lc.min_mag}, max_mag={lc.max_mag}, max_mag_err={lc.max_mag_err}")
+    logger.info(f"  output -> {run.outdir}/ (config saved to {config_path})")
 
     t0 = time.time()
     results = {}
     failures = {}
     n_completed = 0
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(build_lightcurves_by_healpixel,
-                    hpx=hpx, nside=nside, bands=bands,
-                    min_points=min_points, min_mag=min_mag, max_mag=max_mag,
-                    band_1=band_1, band_2=band_2, color_min=color_min, color_max=color_max,
-                    max_mag_err=max_mag_err, outdir=outdir, **kwargs): hpx
-                for hpx in healpixels
-            }
+    with ProcessPoolExecutor(max_workers=run.max_workers) as executor:
+        futures = {executor.submit(build_lightcurves_by_healpixel, hpx, cfg): hpx
+                   for hpx in healpixels}
 
         for future in as_completed(futures):
             hpx = futures[future]
@@ -172,7 +158,7 @@ def run_pipeline(healpix_footprint_fp, nside=NSIDE, bands=BANDS, outdir=OUTDIR,
             except Exception as e:
                 failures[hpx] = str(e)
                 logger.error(f"[{n_completed}/{len(healpixels)}] hpx={hpx}: FAILED -- {e} "
-                            f"(see {outdir}/pipeline_1_lightcurves_logs/hpx{hpx}.log)")
+                            f"(see {run.outdir}/pipeline_1_lightcurves_logs/hpx{hpx}.log)")
 
     elapsed = time.time() - t0
     n_ok = sum(1 for r in results.values() if r['status'] == 'ok')
@@ -184,41 +170,36 @@ def run_pipeline(healpix_footprint_fp, nside=NSIDE, bands=BANDS, outdir=OUTDIR,
     logger.info(f"  Failed: {len(failures)}/{len(healpixels)}")
     if failures:
         logger.info(f"  Failed pixels: {sorted(failures.keys())}")
-        logger.info(f"  Check individual logs in {outdir}/pipeline_1_lightcurves_logs/ for details.")
+        logger.info(f"  Check individual logs in {run.outdir}/pipeline_1_lightcurves_logs/ for details.")
 
     return results, failures
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+                        stream=sys.stdout)
     parser = argparse.ArgumentParser(description="Build and save rescaled DIA lightcurves per HEALPix pixel, in parallel.")
+    parser.add_argument("--config", type=str, required=True, help="YAML config file")
     parser.add_argument("--hpxfp", type=str, required=True, help="HEALPix pixel filepath to process")
-    parser.add_argument("--nside", type=int, default=NSIDE)
-    parser.add_argument("--bands", type=str, default=BANDS)
-    parser.add_argument("--outdir", type=str, default=OUTDIR)
-    parser.add_argument("--min-mag", type=float, default=MIN_MAG)
-    parser.add_argument("--max-mag", type=float, default=MAX_MAG)
-    parser.add_argument("--max-mag-err", type=float, default=MAX_MAG_ERR)
-    parser.add_argument("--band-1", type=str, default=BAND_1)
-    parser.add_argument("--band-2", type=str, default=BAND_2)
-    parser.add_argument("--color-min", type=float, default=COLOR_MIN)
-    parser.add_argument("--color-max", type=float, default=COLOR_MAX)
-    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    # optional overrides of config values
+    parser.add_argument("--nside", type=int, default=None)
+    parser.add_argument("--bands", type=str, default=None)
+    parser.add_argument("--outdir", type=str, default=None)
+    parser.add_argument("--min-mag", type=float, default=None)
+    parser.add_argument("--max-mag", type=float, default=None)
+    parser.add_argument("--max-mag-err", type=float, default=None)
+    parser.add_argument("--band-1", type=str, default=None)
+    parser.add_argument("--band-2", type=str, default=None)
+    parser.add_argument("--color-min", type=float, default=None)
+    parser.add_argument("--color-max", type=float, default=None)
+    parser.add_argument("--max-workers", type=int, default=None)
     args = parser.parse_args()
 
-    run_pipeline(
-        args.hpxfp,
-        nside=args.nside,
-        bands=args.bands,
-        outdir=args.outdir,
-        min_points=MIN_POINTS,
-        min_mag=args.min_mag,
-        max_mag=args.max_mag,
-        max_mag_err=args.max_mag_err,
-        band_1=args.band_1,
-        band_2=args.band_2,
-        color_min=args.color_min,
-        color_max=args.color_max,
-        max_workers=args.max_workers,
-    )
-    
-        
+    cfg = load_config(args.config)
+    cfg = override(cfg, 'run', nside=args.nside, bands=args.bands, outdir=args.outdir,
+                   max_workers=args.max_workers)
+    cfg = override(cfg, 'lightcurves', min_mag=args.min_mag, max_mag=args.max_mag,
+                   max_mag_err=args.max_mag_err, band_1=args.band_1, band_2=args.band_2,
+                   color_min=args.color_min, color_max=args.color_max)
+
+    run_pipeline(args.hpxfp, cfg)

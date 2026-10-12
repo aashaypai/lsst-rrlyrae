@@ -17,21 +17,17 @@ sys.path.append("/sdf/data/rubin/user/pai/projects/processing/catalogs/")
 from healpix_utils import healpix_to_radec, radec_to_healpix
 from utils import get_catalog_refs_cone
 
-from schema import (
-    VISIT_COL, MJD_COL, BAND_COL,
-    ID_COL, FLUX_COL, FLUX_ERR_COL, MAG_COL, MAG_ERR_COL, FLAG_COLS,
-)
 
 
-def calculate_reduced_chi2_mean_mag(table):
-    group = table.groupby([ID_COL, BAND_COL])
+def calculate_reduced_chi2_mean_mag(table, *, cols):
+    group = table.groupby([cols.id, cols.band])
     num_points = group.size()
 
-    diff2_by_err2 = (table[MAG_COL] - group[MAG_COL].transform('mean')) ** 2 / (table[MAG_ERR_COL] ** 2)
-    chi2 = diff2_by_err2.groupby([table[ID_COL], table[BAND_COL]]).sum()
+    diff2_by_err2 = (table[cols.mag] - group[cols.mag].transform('mean')) ** 2 / (table[cols.mag_err] ** 2)
+    chi2 = diff2_by_err2.groupby([table[cols.id], table[cols.band]]).sum()
 
     reduced_chi2 = (chi2 / (num_points - 1)).where(num_points >= 2) # NaN for single-point groups
-    mean_mags = group[MAG_COL].mean()
+    mean_mags = group[cols.mag].mean()
     return reduced_chi2, mean_mags
 
 
@@ -69,15 +65,15 @@ def error_scaling_factor(mag, popt):
 
 
 def fit_chi2_by_healpixel(reduced_chi2, mean_mags, bands, 
-                          min_objects, sigma, maxiters):
+                          min_objects, sigma, maxiters, *, cols):
     fits = {}
     for b in bands:
-        if b not in reduced_chi2.index.get_level_values(BAND_COL):
+        if b not in reduced_chi2.index.get_level_values(cols.band):
             fits[b] = None
             continue
 
-        band_chi2 = reduced_chi2.xs(b, level=BAND_COL)
-        band_mag = mean_mags.xs(b, level=BAND_COL)
+        band_chi2 = reduced_chi2.xs(b, level=cols.band)
+        band_mag = mean_mags.xs(b, level=cols.band)
 
         joined = pd.DataFrame({'mean_mag': band_mag, 'reduced_chi2': band_chi2}).dropna()
         joined = joined[joined['reduced_chi2'] > 0]
@@ -95,30 +91,30 @@ def fit_chi2_by_healpixel(reduced_chi2, mean_mags, bands,
     return fits
 
 
-def rescale_errors_by_healpixel(table, bands, *, min_objects, sigma, maxiters):
-    reduced_chi2, mean_mags = calculate_reduced_chi2_mean_mag(table)
+def rescale_errors_by_healpixel(table, bands, *, min_objects, sigma, maxiters, cols):
+    reduced_chi2, mean_mags = calculate_reduced_chi2_mean_mag(table, cols=cols)
     fits = fit_chi2_by_healpixel(reduced_chi2, mean_mags, bands,
-                                 min_objects, sigma, maxiters)
+                                 min_objects, sigma, maxiters, cols=cols)
 
     rescaled_table = table.copy()
     rescaled_table['chi2_rescaling'] = np.nan
-    rescaled_table[MAG_ERR_COL] = rescaled_table[MAG_ERR_COL].astype(float)
+    rescaled_table[cols.mag_err] = rescaled_table[cols.mag_err].astype(float)
 
     for b in bands:
         popt = fits.get(b)
         if popt is None:
             continue
 
-        band_mean_mag = mean_mags.xs(b, level=BAND_COL)
+        band_mean_mag = mean_mags.xs(b, level=cols.band)
 
-        row_mask = table[BAND_COL] == b
-        obj_ids_this_band = table.loc[row_mask, ID_COL]
+        row_mask = table[cols.band] == b
+        obj_ids_this_band = table.loc[row_mask, cols.id]
         mapped_mean_mag = obj_ids_this_band.map(band_mean_mag)
         has_mean_mag = mapped_mean_mag.notna()
         idx = row_mask[row_mask].index[has_mean_mag.values]
 
         scale = error_scaling_factor(mapped_mean_mag[has_mean_mag].values, popt)
-        rescaled_table.loc[idx, MAG_ERR_COL] = rescaled_table.loc[idx, MAG_ERR_COL].values * scale
+        rescaled_table.loc[idx, cols.mag_err] = rescaled_table.loc[idx, cols.mag_err].values * scale
         rescaled_table.loc[idx, 'chi2_rescaling'] = scale # debugging
 
     return rescaled_table
@@ -126,7 +122,7 @@ def rescale_errors_by_healpixel(table, bands, *, min_objects, sigma, maxiters):
 def rescale_errors_from_zeropoints(dia_obj_frc_src, bands,
                                    repo="dp2_prep",
                                    collections=["LSSTCam/runs/DRP/DP2"],
-                                   instrument="LSSTCam"):
+                                   instrument="LSSTCam", *, cols):
     butler = Butler(repo, 
                     collections=collections,
                     instrument=instrument)
@@ -136,8 +132,8 @@ def rescale_errors_from_zeropoints(dia_obj_frc_src, bands,
     visit_tab = visit_tab[np.isin(visit_tab['band'], [b for b in bands])]
     
     zp_scatter = visit_tab.groupby('visitId')['zeroPoint'].std(ddof=0)
-    zp_err = dia_obj_frc_src[VISIT_COL].map(zp_scatter).fillna(0)
-    dia_obj_frc_src[MAG_ERR_COL] = np.sqrt(dia_obj_frc_src[MAG_ERR_COL]**2 + zp_err**2)
+    zp_err = dia_obj_frc_src[cols.visit].map(zp_scatter).fillna(0)
+    dia_obj_frc_src[cols.mag_err] = np.sqrt(dia_obj_frc_src[cols.mag_err]**2 + zp_err**2)
     dia_obj_frc_src['zp_err'] = zp_err # debugging
     return dia_obj_frc_src
 

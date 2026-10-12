@@ -26,11 +26,11 @@ def fit_vonmises_fisher_kappa(time, result):
 
 def get_period_bounds(rrl_type):
     if rrl_type == 'ab':
-        pmin = 0.2
+        pmin = 0.4
         pmax = 1
     elif rrl_type == 'c':
-        pmin = 0.44
-        pmax = 0.89
+        pmin = 0.2
+        pmax = 0.5
     else:
         raise ValueError(f"rrl_type must be either 'ab' or 'c', currently: {rrl_type}")
     return pmin, pmax
@@ -93,7 +93,7 @@ def full_template_fit(time, mags, mag_errs, bands, rrl_type='ab'):
             best_result = result
             best_template = tmpl
 
-    return best_result, tmpl
+    return best_result, best_template
     
 def period_search(time, mags, mag_errs, bands, rrl_type='ab'):
     pmin, pmax = get_period_bounds(rrl_type)

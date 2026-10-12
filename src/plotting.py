@@ -18,7 +18,6 @@ from pycycle.lsdb_utils import apply_des_to_lsst_correction
 import lsst.geom as geom
 from lsst.daf.butler import Butler
 
-from schema import ID_COL
 
 plt.style.use(os.path.abspath("/sdf/data/rubin/user/pai/matplotlib_style.mplstyle"))
 
@@ -228,7 +227,7 @@ def make_pvi_cutout_gif(cutouts, coords, visits, bands, object_id, plotdir):
 def make_phased_lightcurve_plot(time, mags, mag_errs, bands, *,
                                 period_search_period, template_result, template,
                                 plotdir, object_id=None, 
-                                match=False):
+                                match=False, id_col='ID'):
     mb_bands = template.bands
     band_to_idx_template = {b: i for i, b in enumerate(mb_bands)}
 
@@ -294,7 +293,7 @@ def make_phased_lightcurve_plot(time, mags, mag_errs, bands, *,
 
     title_string = ""
     if object_id is not None:
-        title_string += f"{ID_COL}: {object_id}"
+        title_string += f"{id_col}: {object_id}"
     if match:
         title_string += f" known RRL"
     if title_string != "":

@@ -10,20 +10,20 @@ matplotlib.use('Agg')                 # headless workers; must be set before plo
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from pipe_utils import extract_healpixel, get_filepaths
-from schema import ID_COL, MJD_COL, MAG_COL, MAG_ERR_COL, BAND_COL, VISIT_COL, MAX_WORKERS
+from config import load_config, override, save_config
 from period_fitting import full_template_fit
 from plotting import make_phased_lightcurve_cutout_plot, get_preliminary_visit_image_cutouts, make_pvi_cutout_gif
 
 logger = logging.getLogger(__name__)
 
 
-def plot_candidates_by_file(fp, candidates, plotdir):
+def plot_candidates_by_file(fp, candidates, plotdir, *, cols):
     """Fit and plot every candidate found in one lightcurve_hpx*.parquet file."""
     hpx = extract_healpixel(os.path.basename(fp))
     t0 = time.time()
 
     lc = pd.read_parquet(fp)
-    lc = lc[lc[ID_COL].isin(candidates.index)]                # only candidates in this file
+    lc = lc[lc[cols.id].isin(candidates.index)]                # only candidates in this file
     if lc.empty:                                              # most files: nothing to do, no log file
         return {'hpx': hpx, 'status': 'empty', 'n_plotted': 0, 'failures': {},
                 'found_ids': [], 'elapsed': time.time() - t0}
@@ -38,19 +38,19 @@ def plot_candidates_by_file(fp, candidates, plotdir):
 
     try:
         n_plotted, failures = 0, {}
-        logger.info(f"{lc[ID_COL].nunique()} candidates in {fp}")
-        for obj_id, lightcurves in lc.groupby(ID_COL):
+        logger.info(f"{lc[cols.id].nunique()} candidates in {fp}")
+        for obj_id, lightcurves in lc.groupby(cols.id):
             try:
-                mjd = lightcurves[MJD_COL].to_numpy()          # not `time`: that would shadow the time module
-                mag = lightcurves[MAG_COL].to_numpy()
-                err = lightcurves[MAG_ERR_COL].to_numpy()
-                band = lightcurves[BAND_COL].to_numpy()
-                visits = lightcurves[VISIT_COL].to_numpy()
+                mjd = lightcurves[cols.mjd].to_numpy()          # not `time`: that would shadow the time module
+                mag = lightcurves[cols.mag].to_numpy()
+                err = lightcurves[cols.mag_err].to_numpy()
+                band = lightcurves[cols.band].to_numpy()
+                visits = lightcurves[cols.visit].to_numpy()
                 ra, dec = lightcurves['ra'].iloc[0], lightcurves['dec'].iloc[0]
                 result, tmpl = full_template_fit(mjd, mag, err, band, rrl_type='ab')
 
                 row = candidates.loc[obj_id]
-                title_text = f"{ID_COL}: {obj_id} RRL prob. {row['rrl_prob']:.2f}"
+                title_text = f"{cols.id}: {obj_id} RRL prob. {row['rrl_prob']:.2f}"
                 if 'match' in candidates.columns and row['match'] == True:
                     title_text += " [known RRL]"
 
@@ -68,7 +68,7 @@ def plot_candidates_by_file(fp, candidates, plotdir):
                 # found_visits = list(cutouts_dict.keys())
                 # missing = set(visits) - set(found_visits)
                 # if missing:
-                #     logger.warning(f"{ID_COL} {obj_id}: {len(missing)} visit(s) had no PVI cutout: {sorted(missing)}")
+                #     logger.warning(f"{cols.id} {obj_id}: {len(missing)} visit(s) had no PVI cutout: {sorted(missing)}")
             
                 # sort_idx = np.argsort([cutout_bands_dict[v] for v in found_visits])   # sort by band, via the dict's own values
                 # sorted_visits = [found_visits[i] for i in sort_idx]
@@ -82,33 +82,35 @@ def plot_candidates_by_file(fp, candidates, plotdir):
 
             except Exception as e:                             # one bad object shouldn't stop the rest
                 failures[obj_id] = str(e)
-                logger.exception(f"{ID_COL} {obj_id}: FAILED")
+                logger.exception(f"{cols.id} {obj_id}: FAILED")
 
         elapsed = time.time() - t0
         logger.info(f"{n_plotted} plotted, {len(failures)} failed, took {elapsed:.1f}s")
         return {'hpx': hpx, 'status': 'ok', 'n_plotted': n_plotted, 'failures': failures,
-                'found_ids': lc[ID_COL].unique().tolist(), 'elapsed': elapsed}
+                'found_ids': lc[cols.id].unique().tolist(), 'elapsed': elapsed}
 
     finally:
         logger_root.removeHandler(handler)
         handler.close()
 
 
-def plot_candidates(candidates_filepath, filedir, plotdir, top_n=None, max_workers=MAX_WORKERS):
+def plot_candidates(candidates_filepath, filedir, plotdir, cfg, top_n=None):
+    cols, max_workers = cfg.columns, cfg.run.max_workers
     """Plot every candidate, one lightcurve file per worker process.
 
-    candidates_filepath : parquet with ID_COL and 'rrl_prob' (and optionally 'match')
+    candidates_filepath : parquet with cols.id and 'rrl_prob' (and optionally 'match')
     filedir             : directory of lightcurve_hpx*.parquet files
     top_n               : only plot the top_n candidates by rrl_prob (default: all)
     """
     candidates = pd.read_parquet(candidates_filepath)
     if top_n is not None:
         candidates = candidates.nlargest(top_n, 'rrl_prob')
-    candidates = candidates.drop_duplicates(ID_COL).set_index(ID_COL)
+    candidates = candidates.drop_duplicates(cols.id).set_index(cols.id)
     candidates = candidates[[c for c in ('rrl_prob', 'match') if c in candidates.columns]]
 
     filepaths = get_filepaths(filedir, fn="lightcurve_hpx*.parquet")
     os.makedirs(plotdir, exist_ok=True)
+    save_config(cfg, plotdir, "config_pipeline_5.yaml")
     logger.info(f"{len(candidates)} candidates, {len(filepaths)} lightcurve files in {filedir}")
     logger.info(f"Processing with {max_workers} parallel workers; plots -> {plotdir}/")
 
@@ -117,7 +119,7 @@ def plot_candidates(candidates_filepath, filedir, plotdir, top_n=None, max_worke
     n_completed = 0
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(plot_candidates_by_file, fp, candidates, plotdir): fp for fp in filepaths}
+        futures = {executor.submit(plot_candidates_by_file, fp, candidates, plotdir, cols=cols): fp for fp in filepaths}
 
         for future in as_completed(futures):
             fp = futures[future]
@@ -160,12 +162,16 @@ if __name__ == "__main__":
         stream=sys.stdout,
     )
     parser = argparse.ArgumentParser(description="Plot phased lightcurves + cutouts for RRL candidates.")
-    parser.add_argument("--candidates", type=str, required=True, help="parquet file with ID_COL and rrl_prob")
+    parser.add_argument("--config", type=str, required=True, help="YAML config file")
+    parser.add_argument("--candidates", type=str, required=True, help="parquet file with the id column and rrl_prob")
     parser.add_argument("--lightcurve-dir", type=str, required=True)
     parser.add_argument("--plotdir", type=str, default="./candidates")
     parser.add_argument("--top-n", type=int, default=None, help="only plot the top N candidates by rrl_prob")
-    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    # optional override of config value
+    parser.add_argument("--max-workers", type=int, default=None)
     args = parser.parse_args()
 
-    plot_candidates(args.candidates, args.lightcurve_dir, plotdir=args.plotdir,
-                    top_n=args.top_n, max_workers=args.max_workers)
+    cfg = load_config(args.config)
+    cfg = override(cfg, 'run', max_workers=args.max_workers)
+
+    plot_candidates(args.candidates, args.lightcurve_dir, args.plotdir, cfg, top_n=args.top_n)

@@ -1,0 +1,76 @@
+# Stage 1: pipeline_1.1_build_source_lightcurves.py (Source table)
+# NOTE: sourceId is unique per detection, so it cannot group epochs into
+# lightcurves; see the warning in the README.
+columns:
+  id: sourceId
+  visit: visit
+  mjd: expMidptMJD
+  band: band
+  ext: refExtendedness
+  flux: psfFlux
+  flux_err: psfFluxErr
+  mag: psfMag
+  mag_err: psfMagErr
+  flags:
+    - psfFlux_flag
+    - psfFlux_flag_apCorr
+    - psfFlux_flag_edge
+    - psfFlux_flag_noGoodPixels
+    - pixelFlags_bad
+    - pixelFlags_cr
+    - pixelFlags_crCenter
+    - pixelFlags_edge
+    - pixelFlags_interpolated
+    - pixelFlags_interpolatedCenter
+    - pixelFlags_nodata
+    - pixelFlags_offimage
+    - pixelFlags_saturated
+    - pixelFlags_saturatedCenter
+    - pixelFlags_suspect
+    - pixelFlags_suspectCenter
+
+butler:
+  repo: dp2_prep
+  collections: [LSSTCam/runs/DRP/DP2]
+  instrument: LSSTCam
+
+run:
+  nside: 32
+  bands: ugrizy
+  outdir: rescaled_lightcurves
+  max_workers: 64
+
+lightcurves:                  # stage 1
+  min_points: {g: 0, r: 3, i: 3, z: 0}
+  min_mag: 16
+  max_mag: 23
+  max_mag_err: 0.3
+  band_1: r
+  band_2: i
+  color_min: -0.5
+  color_max: 0.3
+  max_extendedness: 0.5
+  max_sep_arcsec: 1.0         # object <-> diaObject / source match radius
+
+rescaling:                    # stage 1, chi2 error rescaling
+  min_objects_for_fit: 10
+  sigma: 3
+  maxiters: 5
+
+stats_cut:                    # stage 4 candidate selection
+  n_obs_min: {r: 5, i: 5, z: 5}
+  n_obs_max: 1.0e9
+  # SV1000: 3 sigma log reduced chi2 and 2 sigma log significance, fit to RRL distributions
+  log_reduced_chi2_min: {r: 0.857, i: 0.571, z: 0.407}
+  log_reduced_chi2_max: 1.0e9
+  log_significance_min: {r: 0.255, i: 0.570, z: 0.648}
+  log_significance_max: 1.0e9
+  # Sgr stream 90% CDF values
+  # log_reduced_chi2_min: {r: 1.344, i: 1.542, z: 1.602}
+  # log_significance_min: {r: 0.817, i: 1.060, z: 1.079}
+  # Orphan stream 90% CDF values
+  # log_reduced_chi2_min: {r: 1.181, i: 1.297, z: 1.392}
+  # log_significance_min: {r: 0.787, i: 0.905, z: 0.820}
+
+matching:                     # stage 3, external RRL catalogs
+  max_sep_arcsec: 1.0

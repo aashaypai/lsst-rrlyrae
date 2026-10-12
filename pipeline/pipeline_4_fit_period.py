@@ -9,13 +9,8 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from pipe_utils import extract_healpixel, get_filepaths
+from config import load_config, override, save_config
 
-from schema import (
-    ID_COL, MJD_COL, MAG_COL, MAG_ERR_COL, BAND_COL, BANDS,
-    NSIDE, MAX_WORKERS, N_OBS_MIN, N_OBS_MAX,
-    LOG_REDUCED_CHI2_MIN, LOG_REDUCED_CHI2_MAX,
-    LOG_SIGNIFICANCE_MIN, LOG_SIGNIFICANCE_MAX
-)
 
 from period_fitting import period_search, avg_template_fit, fit_vonmises_fisher_kappa
 #from plotting import make_phased_lightcurve_plot
@@ -80,12 +75,12 @@ def stats_cut(stats_table, bands,
     logger.info(f"STATS CUT: kept {full_mask.sum()} / {n_total} rows ({n_total - full_mask.sum()} dropped)")
     return full_mask
     
-def build_full_stats_table(stats_dir, nside=NSIDE):
+def build_full_stats_table(stats_dir, nside, *, cols):
     filepaths = get_filepaths(stats_dir, fn="stats_hpx*.parquet")
     stats = pd.concat([pd.read_parquet(fp) for fp in filepaths], ignore_index=True)
     stats['healpixel'] = radec_to_healpix(stats['ra'].values, stats['dec'].values, nside=nside)
 
-    logger.info(f"generated stats table for the full footprint containing {stats[ID_COL].nunique()} objects")
+    logger.info(f"generated stats table for the full footprint containing {stats[cols.id].nunique()} objects")
 
     return stats
 
@@ -98,7 +93,7 @@ def get_match_table(hpx, matchdir, match_flag='match'):
         return None
     return table
     
-def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None):
+def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None, *, cols):
     hpx = extract_healpixel(fp)
 
     if matchdir is not None:
@@ -121,23 +116,23 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None):
 
     result_coeff_keys = None
     try:
-        object_ids = np.unique(stats_table[stats_table['healpixel'] == hpx][ID_COL].values)
+        object_ids = np.unique(stats_table[stats_table['healpixel'] == hpx][cols.id].values)
         lightcurves = pd.read_parquet(fp)
-        id_mask = np.isin(lightcurves[ID_COL].values, object_ids)
+        id_mask = np.isin(lightcurves[cols.id].values, object_ids)
         lightcurves = lightcurves[id_mask]
 
         rows = []
-        for obj_id, group in lightcurves.groupby(ID_COL):
+        for obj_id, group in lightcurves.groupby(cols.id):
             
             match_flag = False
             if match_table is not None:
-                if obj_id in match_table[ID_COL].values:  
+                if obj_id in match_table[cols.id].values:  
                     match_flag = True
                     
-            epoch_time = group[MJD_COL].values
-            mags = group[MAG_COL].values
-            mag_errs = group[MAG_ERR_COL].values
-            bands = group[BAND_COL].values
+            epoch_time = group[cols.mjd].values
+            mags = group[cols.mag].values
+            mag_errs = group[cols.mag_err].values
+            bands = group[cols.band].values
 
             try:
                 #period_search_results = period_search(epoch_time, mags, mag_errs, bands)
@@ -145,7 +140,7 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None):
                 
                 ## RSS per degree of freedom
                 n_obs_cols = [c for c in stats_table.columns if c.endswith('_n_obs')]
-                band_n_obs = stats_table.loc[stats_table[ID_COL] == obj_id, n_obs_cols]
+                band_n_obs = stats_table.loc[stats_table[cols.id] == obj_id, n_obs_cols]
                 n_obs = band_n_obs.sum(axis=1).item()
                 
                 DOF = 4
@@ -155,10 +150,10 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None):
                 try:
                     mu, mu_err, kappa, kappa_err = fit_vonmises_fisher_kappa(epoch_time, result)
                 except Exception as e:
-                    logger.exception(f"{ID_COL} {obj_id}: Von-Mises Fisher Kappa fit FAILED")
+                    logger.exception(f"{cols.id} {obj_id}: Von-Mises Fisher Kappa fit FAILED")
                     mu, mu_err, kappa, kappa_err = np.nan, np.nan, np.nan, np.nan
                     
-                row = {ID_COL: obj_id,
+                row = {cols.id: obj_id,
                       'match': match_flag,
                       #'P_search': period_search_results.best_period,
                       'P_template': result.best_period,
@@ -175,8 +170,8 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None):
                     result_coeff_keys = list(result.best_coeffs.keys())
 
             except Exception as e:
-                logger.exception(f"{ID_COL} {obj_id}: FAILED; {e}") 
-                row = {ID_COL: obj_id,
+                logger.exception(f"{cols.id} {obj_id}: FAILED; {e}") 
+                row = {cols.id: obj_id,
                       'match': match_flag,
                       'P_template': np.nan,
                       'template_min_rss': np.nan,
@@ -214,24 +209,23 @@ def fit_lightcurve_period_by_healpixel(fp, stats_table, outdir, matchdir=None):
         logger_root.removeHandler(handler)
         handler.close()
 
-def run_pipeline(lightcurve_dir, stats_dir, outdir, 
-                 matchdir=None,
-                 bands=BANDS, nside=NSIDE, max_workers=MAX_WORKERS,
-                 n_obs_min=N_OBS_MIN, n_obs_max=N_OBS_MAX,
-                 log_reduced_chi2_min=LOG_REDUCED_CHI2_MIN,
-                 log_reduced_chi2_max=LOG_REDUCED_CHI2_MAX,
-                 log_significance_min=LOG_SIGNIFICANCE_MIN,
-                 log_significance_max=LOG_SIGNIFICANCE_MAX):
+def run_pipeline(lightcurve_dir, stats_dir, outdir, cfg, matchdir=None):
+    cols, sc = cfg.columns, cfg.stats_cut
+    bands, nside, max_workers = cfg.run.bands, cfg.run.nside, cfg.run.max_workers
 
-    stats_table = build_full_stats_table(stats_dir, nside=nside)
+    os.makedirs(outdir, exist_ok=True)
+    config_path = save_config(cfg, outdir, "config_pipeline_4.yaml")
+    logger.info(f"config saved to {config_path}")
+
+    stats_table = build_full_stats_table(stats_dir, nside=nside, cols=cols)
     stats_mask = stats_cut(stats_table, bands,
-                           n_obs_min, n_obs_max,
-                           log_reduced_chi2_min, log_reduced_chi2_max,
-                           log_significance_min, log_significance_max)
+                           sc.n_obs_min, sc.n_obs_max,
+                           sc.log_reduced_chi2_min, sc.log_reduced_chi2_max,
+                           sc.log_significance_min, sc.log_significance_max)
 
     stats_table = stats_table[stats_mask]
     kept_healpixels = set(np.unique(stats_table['healpixel']))
-    logger.info(f"{stats_table[ID_COL].nunique()} pass the stats cut from {len(kept_healpixels)} unique healpixels (nside {nside})")
+    logger.info(f"{stats_table[cols.id].nunique()} pass the stats cut from {len(kept_healpixels)} unique healpixels (nside {nside})")
 
     filepaths = get_filepaths(lightcurve_dir, fn="lightcurve_hpx*.parquet")
     filepaths = [fp for fp in filepaths if extract_healpixel(os.path.basename(fp)) in kept_healpixels]
@@ -246,7 +240,8 @@ def run_pipeline(lightcurve_dir, stats_dir, outdir,
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(fit_lightcurve_period_by_healpixel, fp, stats_table, outdir, matchdir): fp
+            executor.submit(fit_lightcurve_period_by_healpixel, fp, stats_table, outdir, matchdir,
+                            cols=cols): fp
             for fp in filepaths
         }
 
@@ -282,6 +277,7 @@ if __name__ == "__main__":
         stream=sys.stdout,
     )
     parser = argparse.ArgumentParser(description="Fit periods for lightcurves passing the stats cut.")
+    parser.add_argument("--config", type=str, required=True, help="YAML config file")
     parser.add_argument("--lightcurve-dir", type=str, required=True)
     parser.add_argument("--stats-dir", type=str, required=True)
     parser.add_argument("--outdir", type=str, required=True)
@@ -289,11 +285,13 @@ if __name__ == "__main__":
     #                    help="If given, save phased lightcurve plots here (skipped entirely if not set)")
     parser.add_argument("--matchdir", type=str, default=None,
                        help="If given, checks if the object matches to Gaia DR3")
-    parser.add_argument("--bands", type=str, default=BANDS)
-    parser.add_argument("--nside", type=int, default=NSIDE)
-    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    # optional overrides of config values
+    parser.add_argument("--bands", type=str, default=None)
+    parser.add_argument("--nside", type=int, default=None)
+    parser.add_argument("--max-workers", type=int, default=None)
     args = parser.parse_args()
 
-    run_pipeline(args.lightcurve_dir, args.stats_dir, args.outdir, 
-                 matchdir=args.matchdir, bands=args.bands, 
-                 nside=args.nside, max_workers=args.max_workers)
+    cfg = load_config(args.config)
+    cfg = override(cfg, 'run', bands=args.bands, nside=args.nside, max_workers=args.max_workers)
+
+    run_pipeline(args.lightcurve_dir, args.stats_dir, args.outdir, cfg, matchdir=args.matchdir)

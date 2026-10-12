@@ -16,19 +16,13 @@ sys.path.append("/sdf/data/rubin/user/pai/projects/processing/catalogs/")
 from healpix_utils import healpix_to_radec
 import healpy as hp
 
-from schema import ID_COL, MAX_WORKERS, NSIDE, OUTDIR
 from pipe_utils import extract_healpixel, get_filepaths
+from config import load_config, override, save_config
 
 from match_catalogs import match_muraveva2025, match_gaia_vari_rrlyrae, match_ogle4_blg
 logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
-
-MAX_SEP_ARCSEC = 1.0
-
-def query_gaia_by_healpixel(hpx, nside=NSIDE):
+def query_gaia_by_healpixel(hpx, nside):
     """
     Query the Gaia archive for RR Lyrae sources within a cone around the
     center of HEALPix pixel `hpx`, matching the same 1.1x-pixel-resolution
@@ -58,7 +52,7 @@ def query_gaia_by_healpixel(hpx, nside=NSIDE):
     gaia_table = job.get_results().to_pandas()
     return gaia_table
     
-def match_gaia_by_healpixel(hpx, filepath, outdir, nside=NSIDE, max_sep_arcsec=MAX_SEP_ARCSEC):
+def match_gaia_by_healpixel(hpx, filepath, outdir, nside, max_sep_arcsec, *, cols):
     logdir = os.path.join(outdir, "pipeline_3_match_logs")
     os.makedirs(outdir, exist_ok=True)
     os.makedirs(logdir, exist_ok=True)
@@ -79,7 +73,7 @@ def match_gaia_by_healpixel(hpx, filepath, outdir, nside=NSIDE, max_sep_arcsec=M
         gaia_table = query_gaia_by_healpixel(hpx, nside=nside)
         logger.info(f"  retrieved {len(gaia_table)} Gaia sources")
 
-        stats = stats[[ID_COL, 'ra', 'dec']].copy()
+        stats = stats[[cols.id, 'ra', 'dec']].copy()
         stats = match_gaia_vari_rrlyrae(stats, gaia_table, max_sep_arcsec=max_sep_arcsec)
         stats = match_muraveva2025(stats, max_sep_arcsec=max_sep_arcsec)
         stats = match_ogle4_blg(stats, max_sep_arcsec=max_sep_arcsec)
@@ -105,26 +99,29 @@ def match_gaia_by_healpixel(hpx, filepath, outdir, nside=NSIDE, max_sep_arcsec=M
         handler.close()
 
 
-def run_pipeline(filedir, outdir=OUTDIR, nside=NSIDE, max_sep_arcsec=MAX_SEP_ARCSEC, max_workers=MAX_WORKERS):
+def run_pipeline(filedir, cfg):
+    run, max_sep_arcsec = cfg.run, cfg.matching.max_sep_arcsec
     filepaths = get_filepaths(filedir, fn="stats_hpx*.parquet")
     logger.info(f"Found {len(filepaths)} lightcurve files in {filedir}")
 
-    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(run.outdir, exist_ok=True)
+    config_path = save_config(cfg, run.outdir, "config_pipeline_3.yaml")
 
-    logger.info(f"Processing {len(filepaths)} files with {max_workers} parallel workers")
-    logger.info(f"  nside={nside}, max_sep_arcsec={max_sep_arcsec}")
-    logger.info(f"  output -> {outdir}/")
+    logger.info(f"Processing {len(filepaths)} files with {run.max_workers} parallel workers")
+    logger.info(f"  nside={run.nside}, max_sep_arcsec={max_sep_arcsec}")
+    logger.info(f"  output -> {run.outdir}/ (config saved to {config_path})")
 
     t0 = time.time()
     results = {}
     failures = {}
     n_completed = 0
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=run.max_workers) as executor:
         futures = {}
         for fp in filepaths:
             hpx = extract_healpixel(os.path.basename(fp))
-            futures[executor.submit(match_gaia_by_healpixel, hpx, fp, outdir, nside, max_sep_arcsec)] = hpx
+            futures[executor.submit(match_gaia_by_healpixel, hpx, fp, run.outdir, run.nside,
+                                    max_sep_arcsec, cols=cfg.columns)] = hpx
 
         for future in as_completed(futures):
             hpx = futures[future]
@@ -142,7 +139,7 @@ def run_pipeline(filedir, outdir=OUTDIR, nside=NSIDE, max_sep_arcsec=MAX_SEP_ARC
             except Exception as e:
                 failures[hpx] = str(e)
                 logger.error(f"[{n_completed}/{len(filepaths)}] hpx={hpx}: FAILED -- {e} "
-                            f"(see {outdir}/pipeline_3_match_logs/hpx{hpx}.log)")
+                            f"(see {run.outdir}/pipeline_3_match_logs/hpx{hpx}.log)")
 
     elapsed = time.time() - t0
     n_ok = sum(1 for r in results.values() if r['status'] == 'ok')
@@ -161,13 +158,20 @@ def run_pipeline(filedir, outdir=OUTDIR, nside=NSIDE, max_sep_arcsec=MAX_SEP_ARC
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+                        stream=sys.stdout)
     parser = argparse.ArgumentParser(description="Match lightcurve objects to Gaia sources, per HEALPix pixel.")
+    parser.add_argument("--config", type=str, required=True, help="YAML config file")
     parser.add_argument("--filedir", type=str, required=True)
-    parser.add_argument("--outdir", type=str, default=OUTDIR)
-    parser.add_argument("--nside", type=int, default=NSIDE)
-    parser.add_argument("--max-sep-arcsec", type=float, default=MAX_SEP_ARCSEC)
-    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    # optional overrides of config values
+    parser.add_argument("--outdir", type=str, default=None)
+    parser.add_argument("--nside", type=int, default=None)
+    parser.add_argument("--max-sep-arcsec", type=float, default=None)
+    parser.add_argument("--max-workers", type=int, default=None)
     args = parser.parse_args()
 
-    run_pipeline(args.filedir, outdir=args.outdir, nside=args.nside,
-               max_sep_arcsec=args.max_sep_arcsec, max_workers=args.max_workers)
+    cfg = load_config(args.config)
+    cfg = override(cfg, 'run', outdir=args.outdir, nside=args.nside, max_workers=args.max_workers)
+    cfg = override(cfg, 'matching', max_sep_arcsec=args.max_sep_arcsec)
+
+    run_pipeline(args.filedir, cfg)
